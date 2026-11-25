@@ -1,6 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout } from "node:timers/promises";
@@ -17,18 +18,17 @@ export async function startTsCompiler(
 	runtime: TsRuntime,
 	options: { cwd: string; tsserverPath?: string },
 ): Promise<TsCompilerProcess> {
+	const isWindows = process.platform === "win32";
 	const directory = join(tmpdir(), `pi-ts-${randomUUID()}`);
-	const pipe =
-		process.platform === "win32"
-			? `\\\\.\\pipe\\pi-ts-${randomUUID()}`
-			: join(directory, "socket");
+	const pipe = isWindows
+		? `\\\\.\\pipe\\pi-ts-${randomUUID()}`
+		: join(directory, "socket");
 	const args = [
 		"--api",
 		"--async",
 		"--cwd",
 		options.cwd,
-		"--pipe",
-		process.platform === "win32" ? pipe : directory,
+		...(isWindows ? [] : ["--pipe", directory]),
 	];
 	// Keep the notebook's optimized compiler policy; an explicit user environment wins.
 	const child = spawn(
@@ -37,8 +37,10 @@ export async function startTsCompiler(
 		{
 			cwd: options.cwd,
 			env: { ...process.env, TSRS_FAST: process.env["TSRS_FAST"] ?? "1" },
-			detached: process.platform !== "win32",
-			stdio: ["ignore", "ignore", "inherit"],
+			detached: !isWindows,
+			stdio: isWindows
+				? ["pipe", "pipe", "inherit"]
+				: ["ignore", "ignore", "inherit"],
 		},
 	);
 	let failure: Error | undefined;
@@ -48,6 +50,19 @@ export async function startTsCompiler(
 	const closed = new Promise<void>((resolve) =>
 		child.once("close", () => resolve()),
 	);
+	const server = isWindows
+		? createServer((socket) => {
+				if (child.stdin) socket.pipe(child.stdin, { end: false });
+				if (child.stdout) child.stdout.pipe(socket);
+				socket.on("error", () => {});
+				const onChildClose = () => socket.destroy();
+				child.once("close", onChildClose);
+				socket.once("close", () => {
+					if (child.stdout) child.stdout.unpipe(socket);
+					child.removeListener("close", onChildClose);
+				});
+			})
+		: undefined;
 	let api = new runtime.api.API({ pipe });
 	let closing: Promise<void> | undefined;
 	const close = (): Promise<void> =>
@@ -55,6 +70,8 @@ export async function startTsCompiler(
 			try {
 				await api.close();
 			} finally {
+				server?.close();
+				child.stdin?.end();
 				try {
 					if (
 						child.pid &&
@@ -101,6 +118,12 @@ export async function startTsCompiler(
 			}
 		})());
 	try {
+		if (server) {
+			await new Promise<void>((resolve, reject) => {
+				server.once("error", reject);
+				server.listen(pipe, () => resolve());
+			});
+		}
 		const deadline = performance.now() + 15_000;
 		while (true) {
 			if (failure) throw failure;
